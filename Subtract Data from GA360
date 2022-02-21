@@ -1,0 +1,449 @@
+#Subtract data using SQL in Google BigQuery
+WITH first_purchases AS (
+# Find the start time for the session when the customer made their first purchase
+SELECT 
+    fullVisitorId, # Consider this the customer ID
+    MIN(PARSE_TIMESTAMP('%s', CAST(visitStartTime AS string))) AS firstPurchaseSessionTime # This will show "UTC" as the timezone but I think it's actually Pacific
+FROM 
+    `bigquery-public-data.google_analytics_sample.ga_sessions_*` ga
+WHERE
+    _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+    AND geoNetwork.country = 'United States' # Only looking at US acquisitions so we can assume everything is in USD
+GROUP BY
+    fullVisitorId
+), 
+
+first_purchases_sessions AS (
+# Get session-level data from the session when the customer made their first purchase
+# You'll see later that we have to query session-level data and hit-level data separately
+SELECT 
+    fp.fullVisitorId,
+    ROUND(SUM(totals.transactionRevenue/1000000),2) AS revenue, # I've aggregated all the metrics here but really I don't have to since these are "totals" fields (i.e. session-level) and there will only be one session per customer
+    MAX(visitNumber) AS visitNumber,
+    SUM(totals.hits) AS hits,
+    SUM(totals.pageviews) AS pageviews,
+    COALESCE(SUM(totals.timeOnSite),0) AS timeOnSite,
+    MAX(CASE WHEN channelGrouping = 'Referral' THEN 1 ELSE 0 END) AS referralChannelGrouping,
+    MAX(CASE WHEN channelGrouping = 'Organic Search' THEN 1 ELSE 0 END) AS organicSearchChannelGrouping,
+    MAX(CASE WHEN channelGrouping = 'Direct' THEN 1 ELSE 0 END) AS directChannelGrouping,
+    MAX(CASE WHEN channelGrouping = 'Paid Search' THEN 1 ELSE 0 END) AS paidSearchChannelGrouping,
+    MAX(CASE WHEN device.browser = 'Chrome' THEN 1 ELSE 0 END) AS chromeBrowser,
+    MAX(CASE WHEN device.browser = 'Safari' THEN 1 ELSE 0 END) AS safariBrowser,
+    MAX(CASE WHEN device.operatingSystem = 'Macintosh' THEN 1 ELSE 0 END) AS macintoshOS,
+    MAX(CASE WHEN device.operatingSystem = 'Windows' THEN 1 ELSE 0 END) AS windowsOS,
+    MAX(CASE WHEN device.operatingSystem = 'Chrome OS' THEN 1 ELSE 0 END) AS chromeOS,
+    MAX(CASE WHEN device.operatingSystem = 'Linux' THEN 1 ELSE 0 END) AS LinuxOS,
+    MAX(CASE WHEN geoNetwork.region = 'California' THEN 1 ELSE 0 END) AS california, # dummy variable indicating if the customer was in California
+    MAX(CASE WHEN geoNetwork.region = 'New York' THEN 1 ELSE 0 END) AS newYork, # dummy variable indicating if the customer was in California
+    MAX(CASE WHEN geoNetwork.metro = 'San Francisco-Oakland-San Jose CA' THEN 1 ELSE 0 END) AS bayArea,
+    MAX(CASE WHEN (EXTRACT(Dayofweek FROM (SELECT PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING)))AT TIME ZONE "UTC"))=1 OR(EXTRACT(Dayofweek FROM (SELECT PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING)))AT TIME ZONE "UTC"))=7 THEN 1 ELSE 0 END) AS Weekend,
+    MAX(CASE WHEN trafficSource.isTrueDirect = TRUE THEN 1 ELSE 0 END) AS TrafficSourceTrueDirect,
+    MAX(totals.transactionRevenue/1000000) AS Maxspending,
+    MAX(CASE WHEN (EXTRACT(Quarter FROM (SELECT PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING)))AT TIME ZONE "UTC"))=1 THEN 1 ELSE 0 END )AS Q1,
+    MAX(CASE WHEN (EXTRACT(Quarter FROM (SELECT PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING)))AT TIME ZONE "UTC"))=2 THEN 1 ELSE 0 END )AS Q2,
+    MAX(CASE WHEN (EXTRACT(Quarter FROM (SELECT PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING)))AT TIME ZONE "UTC"))=3 THEN 1 ELSE 0 END )AS Q3,
+    MAX(CASE WHEN (EXTRACT(Quarter FROM (SELECT PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING)))AT TIME ZONE "UTC"))=4 THEN 1 ELSE 0 END )AS Q4
+    
+FROM 
+    `bigquery-public-data.google_analytics_sample.ga_sessions_*` ga
+JOIN
+    first_purchases fp
+ON
+    ga.fullVisitorId = fp.fullVisitorId
+    AND PARSE_TIMESTAMP('%s', CAST(ga.visitStartTime AS string)) = fp.firstPurchaseSessionTime # Only getting data from first purchase
+WHERE
+    _TABLE_SUFFIX < '20170501' 
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+    AND geoNetwork.country = 'United States'
+GROUP BY
+    fp.fullVisitorId
+),
+
+first_purchases_hits AS (
+# Get hit-level data from the session when the customer made their first purchase
+# Hit data is stored in nested fields so we have to query it separately from the session-level data or else the session-level data aggregations would be incorrect
+SELECT 
+    fp.fullVisitorId,
+    SUM(CASE WHEN hits.eCommerceAction.action_type = '6' THEN product.productQuantity ELSE 0 END) AS productQuantityPurchased, # Product quantity in the final transaction
+    MAX(CASE WHEN product.v2ProductCategory LIKE "%Apparel%" AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS apparelPurchased, # dummy variable indicating if any apparel was purchased
+    MAX(CASE WHEN product.v2ProductCategory LIKE "%Office%" AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS officePurchased,# dummy variable indicating if any office supplies were purchased
+    MAX(CASE WHEN product.v2ProductCategory LIKE '%Drinkware%' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS drinkwarePurchased,
+    MAX(CASE WHEN product.v2ProductCategory = 'Lifestyle' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS lifestylePurchased,
+    MAX(CASE WHEN product.v2ProductCategory LIKE '%Bags%' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS bagsPurchased,
+    MAX(CASE WHEN product.v2ProductCategory LIKE '%Electronics%' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS electronicsPurchased,# dummy variable indicating if any electronics were purchased
+    MAX(CASE WHEN product.v2ProductCategory LIKE '%YouTube%' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS BrandYoutubePurchased,
+    MAX(CASE WHEN product.v2ProductCategory LIKE '%Android%' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS BrandAndroidPurchased,
+    MAX(CASE WHEN product.v2ProductCategory LIKE '%Google%' AND hits.eCommerceAction.action_type = '6' THEN 1 ELSE 0 END) AS BrandGooglePurchased,
+    MAX(CASE WHEN hits.eCommerceAction.action_type = '4' THEN 1 ELSE 0 END) AS removedItemFromCart, # dummy variable indicating if they removed something from their cart during the session
+    MAX(CASE WHEN hits.eCommerceAction.action_type = '3' THEN 1 ELSE 0 END) AS addedItemtoCart, 
+    Max(CASE WHEN hits.social.hasSocialSourceReferral = 'Yes' THEN 1 ELSE 0 END) As HasSocialSourceReferral
+FROM 
+    `bigquery-public-data.google_analytics_sample.ga_sessions_*` ga,
+    UNNEST(hits) hits,
+    UNNEST(hits.product) product
+JOIN
+    first_purchases fp
+ON
+    ga.fullVisitorId = fp.fullVisitorId
+    AND PARSE_TIMESTAMP('%s', CAST(ga.visitStartTime AS string)) = fp.firstPurchaseSessionTime # Only getting data from first purchase
+WHERE
+    _TABLE_SUFFIX < '20170501' 
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+    AND geoNetwork.country = 'United States'
+GROUP BY
+    fp.fullVisitorId
+),
+
+# Get session level data that occured after the first purchase session but within 7 days of that session
+# Looking to see if the user came back within a week and had any additional activity
+first_week_sessions AS (
+SELECT 
+    fp.fullVisitorId,
+    COALESCE(SUM(ga.totals.visits),0) AS firstWeekVisits, # Visits from first week of acquisition, excluding acquisition session
+    COALESCE(SUM(ga.totals.transactions),0) AS firstWeekTransactions, # Transactions from first week of acquisition, excluding acquisition session
+    COALESCE(ROUND(SUM(ga.totals.transactionRevenue/1000000),2),0) AS firstWeekRevenue, # Revenue from first week of acquisition, excluding acquisition session
+    COALESCE(SUM(totals.bounces) / SUM(totals.visits),0) AS bounceRate,
+    COALESCE(SUM(totals.transactions)/SUM(totals.visits),0) AS Frequency
+#promotion perhaps did matter!->add afterward
+FROM 
+    first_purchases fp
+LEFT JOIN
+    `bigquery-public-data.google_analytics_sample.ga_sessions_*` ga
+ON 
+    fp.fullVisitorId = ga.fullVisitorId
+    AND TIMESTAMP_DIFF(PARSE_TIMESTAMP('%s', CAST(ga.visitStartTime AS string)), fp.firstPurchaseSessionTime, HOUR) BETWEEN 1 AND 168 # Consider visits between 1 hour and 7 days after first purchase session
+GROUP BY 
+    fp.fullVisitorId
+),
+
+    
+
+future_purchases AS (
+# For each newly acquired customer, look for any purchases that occurred in the next 8-90 days
+SELECT
+    fp.fullVisitorId,
+    ROUND(SUM(ga.totals.transactionRevenue/1000000),2) AS futureRevenue # This is our model target
+FROM 
+    first_purchases fp
+LEFT JOIN
+    `bigquery-public-data.google_analytics_sample.ga_sessions_*` ga
+ON 
+    fp.fullVisitorId = ga.fullVisitorId
+    AND TIMESTAMP_DIFF(PARSE_TIMESTAMP('%s', CAST(ga.visitStartTime AS string)), fp.firstPurchaseSessionTime, DAY) BETWEEN 8 AND 90 # Consider purchases between 8-90 days after acquisition
+WHERE 
+    ga.totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY 
+    fp.fullVisitorId
+),
+
+Daytime_All AS(
+  SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="New York" 
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Los_Angeles"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="California"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Chicago"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Illinois"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Los_Angeles"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Washington"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Chicago"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Texas"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Michigan"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Massachusetts"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="District of Columbia"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Georgia"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Virginia"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Pennsylvania"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Denver"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Colorado"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="North Carolina"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Denver"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Arizona"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Florida"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="New Jersey"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Tennessee"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Ohio"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Los_Angeles"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Oregon"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Chicago"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Minnesota"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Chicago"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Nebraska"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Chicago"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Missouri"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Chicago"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Iowa"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="South Carolina"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Los_Angeles"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Nevada"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/Denver"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Utah"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Indiana"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+
+UNION ALL
+SELECT fullVisitorId, 
+CASE WHEN (EXTRACT(HOUR FROM DATETIME(MIN(PARSE_TIMESTAMP("%s", CAST (GA.visitStartTime AS STRING))), "America/New_York"))) BETWEEN 7 AND 17 THEN 1 ELSE 0 END AS daytime,
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` GA
+WHERE geoNetwork.region="Connecticut"
+AND _TABLE_SUFFIX < '20170501' # The sample data ends in 08/2017 so we want to only look at acquisitions before 05/2017 to ensure they all have at least 90 days of subsequent data available
+    AND totals.transactions > 0
+    AND totals.transactionRevenue > 0
+GROUP BY fullVisitorId 
+)
+
+# Join the list of newly acquired customers to their acquisition session-level data, acquisition hit-level data, first week session-level data, and future day 8-90 revenue
+SELECT
+    first_purchases.*,
+    first_purchases_sessions.* EXCEPT(fullVisitorId),
+    first_purchases_hits.* EXCEPT(fullVisitorId),
+    first_week_sessions.* EXCEPT(fullVisitorId),
+    COALESCE(future_purchases.futureRevenue,0) AS futureRevenue,
+    Daytime_All.*EXCEPT(fullVisitorId)
+FROM 
+    first_purchases
+LEFT JOIN 
+    first_purchases_sessions 
+USING(fullVisitorId)
+LEFT JOIN 
+    first_purchases_hits 
+USING(fullVisitorId)
+LEFT JOIN 
+    future_purchases 
+USING(fullVisitorId)
+LEFT JOIN
+    first_week_sessions 
+USING(fullVisitorId)
+LEFT JOIN
+Daytime_All
+USING(fullVisitorId)
